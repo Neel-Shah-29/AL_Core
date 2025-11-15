@@ -144,7 +144,9 @@ class SetChaining(BaseHow):
             planner.declare(v,is_const=True)
 
         # Search for explanations
+        print(kwargs['funcs'])
         explanation_tree = planner.search_for_explanations(goal, **kwargs)
+    
         self.num_forward_inferences = planner.num_forward_inferences
         return explanation_tree
 

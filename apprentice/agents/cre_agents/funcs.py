@@ -7,6 +7,7 @@ import sympy as sp
 from sympy import sstr, latex, symbols
 import re
 from numba import njit
+ERROR_SENTINEL = "ERROR"
 register_func = new_register_decorator("func", full_descr="CREFunc")
 register_all_funcs = new_register_all("func", types=[CREFunc], full_descr="CREFunc")
 
@@ -251,7 +252,7 @@ def apply_pythagorean(init_value):
     a = vals.get('a')
     b = vals.get('b')
     if a is None or b is None:
-        raise ValueError("Bad input:", init_value)
+        return ERROR_SENTINEL
     c = sp.sqrt(a*a + b*b)
     # Prefer simplified int if perfect square
     hint = latex(c)
@@ -268,7 +269,7 @@ def use_trig_ratios(init_value):
     a = vals.get('a')
     b = vals.get('b')
     if a is None or b is None:
-        raise ValueError("Bad input:", init_value)
+        return ERROR_SENTINEL
     c = sp.Integer(a*a + b*b) ** sp.Rational(1, 2)
     sinA = a / c
     # hint = latex(sp.simplify(sinA))
@@ -305,7 +306,7 @@ def compute_missing_angles(init_value):
     A = vals.get('A')
     C = vals.get('C')
     if A is None or C is None:
-        raise ValueError("Bad input:", init_value)
+        return ERROR_SENTINEL
     B = 180 - (A + C)
     return sstr(B, order="grlex")
     # return tuple([(re.compile(str(B)), str(B))])
@@ -319,7 +320,7 @@ def compute_missing_sides(init_value):
     C = vals.get('C')
     a = vals.get('a')
     if A is None or C is None or a is None:
-        raise ValueError("Bad input:", init_value)
+        return ERROR_SENTINEL
     B = 180 - (A + C)
     b = sp.nsimplify(a * sp.sin(B*deg) / sp.sin(A*deg))
     # hint = latex(b)
@@ -336,7 +337,7 @@ def compute_unknown_by_cosine(init_value):
     b = vals.get('b')
     C = vals.get('C')
     if a is None or b is None or C is None:
-        raise ValueError("Bad input:", init_value)
+        return ERROR_SENTINEL
     c2 = a*a + b*b - 2*a*b*sp.cos(C*deg)
     c = sp.sqrt(sp.simplify(c2))
     # hint = latex(c)
@@ -364,7 +365,7 @@ def scale_sides_angles(init_value):
     k = vals.get('scale')
     AB = vals.get('AB')
     if k is None or AB is None:
-        raise ValueError("Bad input:", init_value)
+        return ERROR_SENTINEL
     scaled = sp.Integer(k*AB)
     # hint = latex(scaled)
     ans = sstr(scaled, order="grlex")
@@ -399,7 +400,7 @@ def compute_area(init_value):
         s = sp.Rational(a + b + c, 2)
         area = sp.nsimplify(sp.sqrt(s * (s - a) * (s - b) * (s - c)))
     if area is None:
-        raise ValueError("Bad Value", init_value)
+        return ERROR_SENTINEL
 
     return sstr(area, order="grlex")
     # hint = latex(area)

@@ -258,6 +258,8 @@ class SkillApplication(object):
         self.how_help = how_help
         self.explanation_selected = explanation_selected
         self.is_demo = is_demo
+        if "hint_precond" in kwargs:
+            self.hint_precond = kwargs["hint_precond"]
 
     def add_seq_tracking(self, prob_uid=None):
         if(prob_uid is not None):
@@ -1558,7 +1560,7 @@ class CREAgent(BaseDIPLAgent):
               remove: bool=False, **kwargs):
         # print("action", action, type(action))
 
-        state = self.standardize_state(state, is_start)
+        state = self.standardize_state(state, is_start) #### get the feacturized state representation from this representation
 
         # print("<<")
         # print(state)
@@ -2441,5 +2443,4 @@ Thoughts on what is going on w/ When:
 
 
 '''
-
 

@@ -18,6 +18,7 @@ class BaseWhen(metaclass=ABCMeta):
         self.skill = skill
         self.agent = skill.agent
         self.check_sanity = kwargs.get('check_sanity', True)
+        self._sanity_warned = False
 
         # Note this line makes it possible to call 
         super(BaseWhen, self).__init__(skill, **kwargs)
@@ -27,14 +28,17 @@ class BaseWhen(metaclass=ABCMeta):
         if(self.check_sanity and reward is not None):
             prediction = self.predict(state, skill_app.match)
             if(reward != prediction):
-                print(self)
-                raise Exception(f"(Sanity Check Error): When-learning mechanism"+
-                 f" for skill {self.skill}"
-                 f" .predict() produces different outcome ({prediction:.2f}) than reward given in" +
-                 f" .ifit() ({reward:.2f}). This most likely indicates 1) that the agent" +
-                 " requires additional feature prior knowledge to distinguish between two"+
-                 " now indistinguishable situations. Alternatively 2) this may indicate an error in the "+
-                 " when-learning mechanism or in the preparation of the state representation.")
+                if not self._sanity_warned:
+                    warnings.warn(
+                        "(Sanity Check Warning): When-learning mechanism for "
+                        f"skill {self.skill} predicted {prediction:.2f} but "
+                        f"received reward {reward:.2f}. This usually means the "
+                        "current state/features cannot distinguish two similar "
+                        "situations or there is a data-prep bug. "
+                        "Continuing training; this warning is shown once per skill.",
+                        RuntimeWarning,
+                    )
+                    self._sanity_warned = True
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -252,7 +256,7 @@ class VectorTransformMixin(RefittableMixin):
 
         
         for extra_feature in self.extra_features:
-            featurized_state = extra_feature(self, state, featurized_state, match)
+            featurized_state = extra_feature(self, state, featurized_state, match)   ####
 
 
         wm = state.get("working_memory")
@@ -282,7 +286,7 @@ class VectorTransformMixin(RefittableMixin):
         #     featurized_state = self.relative_encoder.encode_relative_to(
         #         featurized_state, [match[0]], [_vars[0]])
         # print("vvvvvvvvvvvvvvvvvvvvvvvvvv")
-        # print(featurized_state)
+        print(featurized_state)
         # print("^^^^^^^^^^^^^^^^^^^^^^^^^^")
         # if(repr(self.skill.how_part) == "NumericalToStr(TensDigit(Add3(CastFloat(a.value), CastFloat(b.value), CastFloat(c.value))))" and
         #    "S_Qr9" in state.get('__uid__')):

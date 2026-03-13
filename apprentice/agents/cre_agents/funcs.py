@@ -178,7 +178,38 @@ def _parse_vals(text):
 
 # @njit(cache=True)
 def _any_match(pattern, text):
-    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+    """Safe matching helper that avoids regex on malformed planner strings."""
+    try:
+        t = str(text or "")
+    except Exception:
+        return False
+    tl = t.lower()
+    pl = str(pattern).lower()
+
+    # Fast-path patterns used in this file.
+    if pl == r"^\s*right\s*triangle":
+        s = tl.strip()
+        return s.startswith("right") and "triangle" in s
+    if pl == r"^\s*asa\s*:\s*":
+        return tl.strip().startswith("asa:")
+    if pl == r"^\s*aas\s*:\s*":
+        return tl.strip().startswith("aas:")
+    if pl == r"\bssa\b":
+        tokens = re.split(r"[^a-z0-9]+", tl)
+        return "ssa" in tokens
+    if pl == r"^\s*sas\s*:\s*":
+        return tl.strip().startswith("sas:")
+    if pl == r"^\s*sss\s*:\s*":
+        return tl.strip().startswith("sss:")
+    if pl == r"^\s*sim\s*:\s*":
+        return tl.strip().startswith("sim:")
+    if pl == r"^\s*area\s*:\s*":
+        return tl.strip().startswith("area:")
+
+    try:
+        return re.search(pattern, t, flags=re.IGNORECASE) is not None
+    except Exception:
+        return False
 
 # @njit(cache=True)
 def _ok_any():
@@ -196,54 +227,20 @@ def normalize_inputs(init_value):
 
 @CREFunc(signature=string(string), shorthand = 'classify_triangle({0})', nopython=False)
 def classify_triangle(init_value):
-    # Accept user-friendly labels while constraining to the scenario in the prompt.
-    # We return multiple acceptable patterns but one concise hint string.
-    def pack(patterns, hint):
-        return tuple([(re.compile(pat, re.I), hint) for pat in patterns])
-
-    if _any_match(r"^\s*Right\s*triangle", init_value):
-        return pack([
-            r"right",
-            r"right\s*triangle",
-            r"righttriangletrig",
-            r"right-?angled",
-            r"rt|rtt",
-            r"R*(i*(g*(h*t)))"
-        ], "Right")
-    if (_any_match(r"^\s*ASA\s*:\s*", init_value)
-        or _any_match(r"^\s*AAS\s*:\s*", init_value)
-        or _any_match(r"\bSSA\b", init_value)):
-        return pack([
-            r"sines",
-            r"law\s*of\s*sines",
-            r"los|sin",
-            r"S*(i*(n*(e*s)))"
-        ], "Sines")
-    if _any_match(r"^\s*SAS\s*:\s*", init_value) or _any_match(r"^\s*SSS\s*:\s*", init_value):
-        return pack([
-            r"cosines",
-            r"law\s*of\s*cosines",
-            r"loc|cos",
-            r"C*(o*(s*(i*(n*(e*s)))))"
-        ], "Cosines")
-    if _any_match(r"^\s*SIM\s*:\s*", init_value):
-        return pack([
-            r"similarity",
-            r"similarity\s*scaling",
-            r"sim"
-        ], "Similarity")
-    if _any_match(r"^\s*AREA\s*:\s*", init_value):
-        return pack([
-            r"area",
-            r"area\s*relations",
-            r"heron|\b1/2\s*ab\s*sin\s*c\b"
-        ], "Area")
-    # Fallback: default to Sines family but accept broad labels
-    return pack([
-        r"sines",
-        r"law\s*of\s*sines",
-        r"los|sin"
-    ], "Sines")
+    # Return a single canonical label to avoid regex-heavy matching in planner calls.
+    txt = str(init_value or "").strip().lower()
+    if txt.startswith("right") and "triangle" in txt:
+        return "Right"
+    if txt.startswith("asa:") or txt.startswith("aas:") or "ssa" in re.split(r"[^a-z0-9]+", txt):
+        return "Sines"
+    if txt.startswith("sas:") or txt.startswith("sss:"):
+        return "Cosines"
+    if txt.startswith("sim:"):
+        return "Similarity"
+    if txt.startswith("area:"):
+        return "Area"
+    # Fallback for under-specified prompts.
+    return "Sines"
 
 @CREFunc(signature=string(string), shorthand = 'apply_pythagorean({0})', nopython=False)
 def apply_pythagorean(init_value):
@@ -281,7 +278,8 @@ def use_trig_ratios(init_value):
 @CREFunc(signature=string(string), shorthand = 'resolve_ssa_ambiguity({0})',nopython=False)
 def resolve_ssa_ambiguity(init_value):
     # If SSA present -> ambiguous; else unique
-    ambiguous = _any_match(r"\bSSA\b", init_value)
+    tokens = re.split(r"[^a-z0-9]+", str(init_value or "").lower())
+    ambiguous = "ssa" in tokens
     expected = "ambiguous" if ambiguous else "unique"
     return expected
 

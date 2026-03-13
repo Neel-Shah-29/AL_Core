@@ -19,9 +19,14 @@ import gc
 import hashlib
 import base64
 import json
+import os
 from datetime import datetime
 
 from typing import Union, List, Tuple
+
+
+def _cre_agent_debug_enabled():
+    return os.environ.get("CRE_AGENT_DEBUG", "0") == "1"
 
 
 def used_bytes(garbage_collect=True):
@@ -537,6 +542,9 @@ class CREAgent(BaseDIPLAgent):
         
 
     def __init__(self, encode_neighbors=True, **config):
+        self.hint_only_ignore_reward = bool(config.get("hint_only_ignore_reward", False))
+        self.hint_only_default_reward = float(config.get("hint_only_default_reward", 1.0))
+
         # Parent defines learning-mechanism classes and args + action_chooser
         super().__init__(**config)
 
@@ -1393,7 +1401,8 @@ class CREAgent(BaseDIPLAgent):
         # Make new skill.
         skill = Skill(self, action.action_type, how_part,  
             label=label, explanation_set=explanation_set)
-        print("INDUCE SKILL", skill, skill.how_part)
+        if _cre_agent_debug_enabled():
+            print("INDUCE SKILL", skill, skill.how_part)
 
         # print("INDUCE SKILL", skill)
 
@@ -1526,13 +1535,15 @@ class CREAgent(BaseDIPLAgent):
             if(hasattr(skill, 'in_proc_when_lrn_mech') and (
                 reward > 0 or getattr(skill_app, 'in_process', False) == True)
                ):
-                print("FIT IN PROC", skill_app)
+                if _cre_agent_debug_enabled():
+                    print("FIT IN PROC", skill_app)
                 app_rews = [(sa, rew) for sa, (ind, rew) in skill.when_lrn_mech.examples.items()
                             if getattr(sa, 'in_process', False)==True or rew > 0]
                 with PrintElapse("IN PROC FIT:"):
                     skill.in_proc_when_lrn_mech.fit(app_rews)
             else:
-                print("FIT OUT PROC", skill_app)
+                if _cre_agent_debug_enabled():
+                    print("FIT OUT PROC", skill_app)
 
         skill_app.train_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1545,6 +1556,7 @@ class CREAgent(BaseDIPLAgent):
               # Extra annotations 
               arg_foci: List[str]=None, 
               how_help: str=None, 
+              ######ADD When_help????
               explanation_selected: str=None,
               
               # Skill / SkillApp identifiers 
@@ -1559,6 +1571,16 @@ class CREAgent(BaseDIPLAgent):
               _ifit_implict: bool=True, 
               remove: bool=False, **kwargs):
         # print("action", action, type(action))
+        hint_only_mode = bool(kwargs.pop("hint_only_mode", False) or self.hint_only_ignore_reward)
+        attempted_action = kwargs.pop("attempted_action", None)
+        attempted_reward = kwargs.pop("attempted_reward", None)
+        orig_reward = reward
+        if hint_only_mode and not remove and reward is not None:
+            reward = self.hint_only_default_reward
+            if _cre_agent_debug_enabled() and reward != orig_reward:
+                print(f"[CREAgent] hint_only_mode: overriding reward {orig_reward} -> {reward}")
+            if _cre_agent_debug_enabled() and attempted_action is not None:
+                print(f"[CREAgent] hint_only_mode: observed attempted action reward={attempted_reward}")
 
         state = self.standardize_state(state, is_start) #### get the feacturized state representation from this representation
 
@@ -1569,7 +1591,8 @@ class CREAgent(BaseDIPLAgent):
         # Find a SkillApp which explains the provided action, and other annotations
         if(not isinstance(action, SkillApplication)):
             action = self.standardize_action(action)        
-            print("ACTION STAND: ", action)
+            if _cre_agent_debug_enabled():
+                print("ACTION STAND: ", action)
             arg_foci = self.standardize_arg_foci(arg_foci, kwargs)
             skill_app = self._resolve_skill_app(state, action, arg_foci=arg_foci, 
                     how_help=how_help, skill_app_uid=skill_app_uid, skill_label=skill_label, skill_uid=skill_uid,
@@ -1586,7 +1609,8 @@ class CREAgent(BaseDIPLAgent):
 
         if(len(skill_app.skill.skill_apps) > 0):
             skill_app.ensure_when_pred()
-            print(f"{skill_app.when_pred:.2f}->{reward}", skill_app)
+            if _cre_agent_debug_enabled():
+                print(f"{skill_app.when_pred:.2f}->{reward}", skill_app)
             # print("ANNOTATE ARG FOCI:", arg_foci)
 
         if(remove or reward is None):
@@ -1601,7 +1625,7 @@ class CREAgent(BaseDIPLAgent):
             # Annotate explicit calls to train() with a 
             #  time-stamp, explicit_reward, and other info.
             skill_app.annotate_train_data(reward, arg_foci, skill_label, skill_uid, 
-                how_help, explanation_selected, **kwargs)
+                how_help, explanation_selected, **kwargs)  ### Add when help here as an attrribute of skill_app
 
             # Pass the reward to various learning mechanisms
             self._ifit_skill_app(skill_app, reward, is_start, **kwargs)
@@ -1610,7 +1634,8 @@ class CREAgent(BaseDIPLAgent):
             if(_ifit_implict):
                 skill_app.ifit_implicit_dependants()
 
-        print("SkillApp: ", skill_app)
+        if _cre_agent_debug_enabled():
+            print("SkillApp: ", skill_app)
         
         return skill_app
 
@@ -2443,4 +2468,3 @@ Thoughts on what is going on w/ When:
 
 
 '''
-

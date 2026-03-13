@@ -1,10 +1,17 @@
 import numpy as np
+from pathlib import Path
 import warnings
+import os
 from abc import ABCMeta
 from abc import abstractmethod
 from cre.utils import PrintElapse
 from .registers import register_when
 from ....shared import ElapseLogger
+from apprentice.agents.cre_agents.hint_nlp import build_hf_llm_call
+
+
+def _when_weight_debug_enabled():
+    return os.environ.get("CRE_STAND_WEIGHT_DEBUG", "0") == "1"
 
 
 
@@ -151,7 +158,12 @@ class RefittableMixin():
             # NOTE: temping to only re-insert on reward changes, but meta-features can make it helpful
             #  to retrain if possible new feautres. 
             self.examples[skill_app] = (new_index, reward)
-            transformed_state = self.transform(state, skill_app.match)
+            prev_active_skill_app = getattr(self, "_active_skill_app", None)
+            self._active_skill_app = skill_app
+            try:
+                transformed_state = self.transform(state, skill_app.match)
+            finally:
+                self._active_skill_app = prev_active_skill_app
             
 
 
@@ -199,6 +211,17 @@ class VectorTransformMixin(RefittableMixin):
         self.one_hot = one_hot
         self.encode_missing = encode_missing
         self.rel_enc_min_sources = rel_enc_min_sources
+        self.gated_hints = kwargs.get('gated_hints', False)
+        self.gated_use_llm = kwargs.get('gated_use_llm', False)
+        self.gated_filter_labels = kwargs.get('gated_filter_labels', True)
+        self.gated_upweight = kwargs.get('gated_upweight', 5.0)
+        self.gated_hint_map = kwargs.get('gated_hint_map', None)
+        self.apply_ft_weights_to_nominal = kwargs.get('apply_ft_weights_to_nominal', False)
+        self.hint_key_resolver = kwargs.get('hint_key_resolver', None)
+        self.weight_debug = kwargs.get('weight_debug', _when_weight_debug_enabled())
+        self.weighted_hint_only = kwargs.get('predict_with_weight_only', False)
+        self._last_ft_weights = None
+        self._active_skill_app = None
 
         agent = skill.agent
 
@@ -247,6 +270,91 @@ class VectorTransformMixin(RefittableMixin):
         self.X_nom = np.empty((0,0), dtype=np.int64)
         self.Y = np.empty(0, dtype=np.int64)
 
+    def _wdebug(self, msg):
+        if self.weight_debug:
+            skill_name = getattr(self.skill, "action_type", "unknown_skill")
+            print(f"[WhenWeightDebug:{skill_name}] {msg}")
+
+    def _resolve_gated_hint_key(self):
+        if callable(self.hint_key_resolver):
+            try:
+                return self.hint_key_resolver(self.skill)
+            except Exception:
+                pass
+        active_skill_app = getattr(self, "_active_skill_app", None)
+        if active_skill_app is not None:
+            try:
+                active_action = getattr(active_skill_app, "action", None)
+                active_selection = getattr(active_action, "selection", None)
+                if isinstance(active_selection, str) and active_selection:
+                    return active_selection
+            except Exception:
+                pass
+        try:
+            for skill_app in getattr(self.skill, "skill_apps", {}).values():
+                action = getattr(skill_app, "action", None)
+                selection = getattr(action, "selection", None)
+                if isinstance(selection, str) and selection:
+                    return selection
+        except Exception:
+            pass
+        if getattr(self.skill, "label", None):
+            return self.skill.label
+        return getattr(self.skill, "action_type", None)
+
+    def _compute_gated_weights(self, featurized_state):
+        if not self.gated_hints:
+            return None
+        gated = None
+        try:
+            from tutor_gym.sandbox.geometry import run_al_copy_2 as gated
+        except Exception:
+            gated = None
+        if gated is None:
+            try:
+                import importlib.util
+                module_path = Path(__file__).resolve().parents[5] / "tutor_gym" / "sandbox" / "geometry" / "run_al_copy_2.py"
+                spec = importlib.util.spec_from_file_location("run_al_copy_2", module_path)
+                if spec and spec.loader:
+                    gated = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(gated)
+            except Exception:
+                return None
+
+        hint_key = self._resolve_gated_hint_key()
+        hint_text = gated.resolve_hint_text(hint_key, hint_map=self.gated_hint_map)
+
+        llm_call = None
+        if self.gated_use_llm:
+            try:
+                llm_call = build_hf_llm_call()
+            except Exception:
+                llm_call = None
+
+        predicates, gvals = gated.extract_predicates(featurized_state)
+        if not predicates:
+            self._wdebug("No predicates found; cannot compute gated feature weights.")
+            return None
+
+        indices = gated.select_hint_predicates(
+            predicates,
+            hint_text,
+            llm_call=llm_call,
+            filter_labels=self.gated_filter_labels,
+        )
+        selected_gvals = [gvals[i] for i in indices]
+        _, weights = gated.build_weight_vector(
+            self.vectorizer,
+            selected_gvals,
+            upweight=self.gated_upweight,
+        )
+        n_up = int(np.count_nonzero(weights > 1.0))
+        self._wdebug(
+            f"Computed weights for hint_key={hint_key!r}; selected={len(indices)} predicates, "
+            f"upweighted_slots={n_up}, max_weight={float(np.max(weights)) if len(weights) else 0.0}"
+        )
+        return weights
+
     def transform(self, state, match):
         featurized_state = state.get("flat_featurized")
 
@@ -286,7 +394,7 @@ class VectorTransformMixin(RefittableMixin):
         #     featurized_state = self.relative_encoder.encode_relative_to(
         #         featurized_state, [match[0]], [_vars[0]])
         # print("vvvvvvvvvvvvvvvvvvvvvvvvvv")
-        print(featurized_state)
+        # print(featurized_state)
         # print("^^^^^^^^^^^^^^^^^^^^^^^^^^")
         # if(repr(self.skill.how_part) == "NumericalToStr(TensDigit(Add3(CastFloat(a.value), CastFloat(b.value), CastFloat(c.value))))" and
         #    "S_Qr9" in state.get('__uid__')):
@@ -297,6 +405,18 @@ class VectorTransformMixin(RefittableMixin):
             
 
         continuous, nominal = self.vectorizer(featurized_state)
+        self._last_ft_weights = self._compute_gated_weights(featurized_state)
+        if self._last_ft_weights is not None:
+            n_up = int(np.count_nonzero(self._last_ft_weights > 1.0))
+            self._wdebug(
+                f"Transform produced nominal_len={len(nominal)} and weight_len={len(self._last_ft_weights)} "
+                f"(upweighted_slots={n_up})"
+            )
+        if self.apply_ft_weights_to_nominal and self._last_ft_weights is not None:
+            max_len = min(len(nominal), len(self._last_ft_weights))
+            if max_len > 0:
+                nominal = nominal.astype(np.int64, copy=True)
+                nominal[:max_len] = nominal[:max_len] * self._last_ft_weights[:max_len].astype(np.int64)
         #### -------Print mapping------------####
         # print(self.skill)
         # print(self.vectorizer)
@@ -371,12 +491,40 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
         BaseWhen.__init__(self, skill,**kwargs)
         VectorTransformMixin.__init__(self, skill, **kwargs)
 
+    def _get_ft_weights(self):
+        ft_weights = getattr(self, "_last_ft_weights", None)
+        if ft_weights is None:
+            self._wdebug("No cached feature weights available for STAND fit.")
+            return None
+        if self.X_nom.size == 0:
+            self._wdebug("X_nom is empty; skipping feature weights.")
+            return None
+        m = self.X_nom.shape[1]
+        if m == 0:
+            self._wdebug("X_nom has zero columns; skipping feature weights.")
+            return None
+        if len(ft_weights) < m:
+            ft_weights = np.pad(ft_weights, (0, m - len(ft_weights)), constant_values=1.0)
+        elif len(ft_weights) > m:
+            ft_weights = ft_weights[:m]
+        ft_weights = ft_weights.astype(np.float64)
+        n_up = int(np.count_nonzero(ft_weights > 1.0))
+        self._wdebug(
+            f"Prepared STAND nominal weights len={len(ft_weights)}, upweighted_slots={n_up}, "
+            f"max_weight={float(np.max(ft_weights)) if len(ft_weights) else 0.0}"
+        )
+        return ft_weights
+
     def ifit(self, state, skill_app, reward):
         self.add_example(state, skill_app, reward) # Insert into X_nom, Y
         if(len(self.X_nom) == 0): return
 
-        # with PrintElapse(f"{type(self).__name__} fit:"):
-        self.classifier.fit(self.X_nom, None, self.Y) # Re-fit
+        nom_ft_weights = self._get_ft_weights()
+        self._wdebug(
+            f"Calling STAND.fit from ifit with X_nom_shape={self.X_nom.shape}, y_len={len(self.Y)}, "
+            f"weights_present={nom_ft_weights is not None}"
+        )
+        self.classifier.fit(self.X_nom, None, self.Y, nom_ft_weights=nom_ft_weights) # Re-fit ####
 
     def fit(self, skill_app_reward_pairs):
         cover = set()
@@ -389,20 +537,64 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
         not_cover = old_apps.difference(cover)
         for skill_app in not_cover:
             state = skill_app.state
-            state.remove_example(state, skill_app)
+            self.remove_example(state, skill_app)
 
-        self.classifier.fit(self.X_nom, None, self.Y) # Re-fit
+        nom_ft_weights = self._get_ft_weights()
+        self._wdebug(
+            f"Calling STAND.fit from fit with X_nom_shape={self.X_nom.shape}, y_len={len(self.Y)}, "
+            f"weights_present={nom_ft_weights is not None}"
+        )
+        self.classifier.fit(self.X_nom, None, self.Y, nom_ft_weights=nom_ft_weights) # Re-fit
 
     def remove(self, state, skill_app):
         self.remove_example(state, skill_app) # Remove from X_nom, Y
         if(len(self.X_nom) == 0): return
-        self.classifier.fit(self.X_nom, None, self.Y) # Re-fit
+        nom_ft_weights = self._get_ft_weights()
+        self._wdebug(
+            f"Calling STAND.fit from remove with X_nom_shape={self.X_nom.shape}, y_len={len(self.Y)}, "
+            f"weights_present={nom_ft_weights is not None}"
+        )
+        self.classifier.fit(self.X_nom, None, self.Y, nom_ft_weights=nom_ft_weights) # Re-fit
 
-    def predict(self, state, match):
+    def _predict_with_weighted_features_only(self, X_nom_subset):
+        if X_nom_subset.size == 0:
+            return 1
+        ft_weights = self._get_ft_weights()
+        if ft_weights is None:
+            return self.classifier.predict(X_nom_subset, None)[0]
+
+        upweighted = np.where(ft_weights > 1.0)[0]
+        upweighted = upweighted[upweighted < X_nom_subset.shape[1]]
+        n_up = len(upweighted)
+        if n_up == 0:
+            return 1
+
+        active_up = np.where(X_nom_subset[0, upweighted] != 0)[0]
+        n_active = len(active_up)
+
+        if self.weight_debug:
+            self._wdebug(
+                f"Hint-only predict: upweighted={n_up}, active_upweighted={n_active}"
+            )
+
+        return 1 if n_active == n_up else -1
+
+    def predict(self, state, match):   ### if mode is natural langauge, then take self.get_ft_weights and see if all the upweighted feactures are 1 in one hot encoded
         if(len(self.X_nom) == 0): return 1
         continuous, nominal = self.transform(state, match)
-        X_nom_subset = nominal[:self.X_nom.shape[1]].reshape(1,-1)
-        prediction = self.classifier.predict(X_nom_subset, None)[0]        
+        X_nom_subset = nominal[:self.X_nom.shape[1]].reshape(1,-1)  ### check this against feacture weights
+        if self.weighted_hint_only:
+            return self._predict_with_weighted_features_only(X_nom_subset)
+
+        if self.weight_debug:
+            ft_weights = self._get_ft_weights()
+            if ft_weights is not None:
+                active = np.where(X_nom_subset[0] != 0)[0]
+                active_up = [int(i) for i in active if i < len(ft_weights) and ft_weights[i] > 1.0]
+                self._wdebug(
+                    f"Predict call active_features={len(active)}, active_upweighted={len(active_up)}"
+                )
+        prediction = self.classifier.predict(X_nom_subset, None)[0]
         return prediction
 
     def __str__(self):
@@ -504,6 +696,9 @@ class STAND(BasicSTAND):
 
         continuous, nominal = self.transform(state, match)
         X_nom_subset = nominal[:self.X_nom.shape[1]].reshape(1,-1)        
+        if self.weighted_hint_only:
+            return self._predict_with_weighted_features_only(X_nom_subset)
+
         # prediction = self.classifier.predict(X_nom_subset, None)[0]
         # ia = self.classifier.instance_ambiguity(X_nom_subset[-1], None)
         # print("IA", ia)
@@ -515,4 +710,3 @@ class STAND(BasicSTAND):
 
         return labels[best_ind] * (probs[best_ind])
         # return labels[best_ind] * (probs[best_ind]-probs[~best_ind])
-

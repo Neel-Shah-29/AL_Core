@@ -1,4 +1,5 @@
 import warnings
+import os
 from abc import ABCMeta
 from abc import abstractmethod
 # from ...extending import new_register_decorator, registries
@@ -144,7 +145,9 @@ class SetChaining(BaseHow):
             planner.declare(v,is_const=True)
 
         # Search for explanations
-        print(kwargs['funcs'])
+        # Optional debug dump of planner functions for deep troubleshooting.
+        if os.environ.get("CRE_HOW_DEBUG_FUNCS") == "1":
+            print(kwargs['funcs'])
         explanation_tree = planner.search_for_explanations(goal, **kwargs)
     
         self.num_forward_inferences = planner.num_forward_inferences

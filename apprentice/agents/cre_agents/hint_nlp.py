@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import re
 import os
+import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, Any, Callable, Optional, List
 import ast
+import json
 
 from tutorgym.shared import Action
 
@@ -378,6 +380,95 @@ def get_openai_token() -> Optional[str]:
     return None
 
 
+def get_openai_base_url() -> Optional[str]:
+    """
+    Retrieve an optional OpenAI-compatible base URL from environment variables
+    or a local secrets file.
+    """
+    for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return raw
+
+    secrets_paths = [Path("secrets.json")]
+    for path in secrets_paths:
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+                        raw = str(data.get(key, "")).strip()
+                        if raw:
+                            return raw
+            except Exception:
+                continue
+    return None
+
+
+def get_openai_model(default: str = "gpt-4-turbo") -> str:
+    """
+    Retrieve the hint-LLM model name from environment variables or a secrets file.
+    """
+    for key in ("CRE_HINT_OPENAI_MODEL", "OPENAI_MODEL"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return raw
+
+    secrets_paths = [Path("secrets.json")]
+    for path in secrets_paths:
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    for key in ("CRE_HINT_OPENAI_MODEL", "OPENAI_MODEL"):
+                        raw = str(data.get(key, "")).strip()
+                        if raw:
+                            return raw
+            except Exception:
+                continue
+    return default
+
+
+def _get_llm_seed() -> Optional[int]:
+    raw = os.environ.get("CRE_HINT_LLM_SEED", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _get_llm_temperature(default: float = 0.0) -> float:
+    raw = os.environ.get("CRE_HINT_LLM_TEMPERATURE", "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _get_llm_cache_dir() -> Optional[Path]:
+    raw = os.environ.get("CRE_HINT_LLM_CACHE_DIR", "").strip()
+    if not raw:
+        return None
+    cache_dir = Path(raw).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _cache_key(model_name: str, messages: List[Dict[str, str]], seed: Optional[int], temperature: float) -> str:
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "seed": seed,
+        "temperature": temperature,
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def build_openai_llm_call(model_name: str = "gpt-4-turbo"):
     """
     Builds a callable that uses the OpenAI Chat Completion API.
@@ -385,28 +476,76 @@ def build_openai_llm_call(model_name: str = "gpt-4-turbo"):
     api_key = get_openai_token()
     if not api_key:
         return None
-        
+
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+        base_url = get_openai_base_url()
+        resolved_model_name = get_openai_model(model_name)
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = OpenAI(**client_kwargs)
+        seed = _get_llm_seed()
+        temperature = _get_llm_temperature(0.0)
+        cache_dir = _get_llm_cache_dir()
         
         def _call(msgs_or_str):
             if isinstance(msgs_or_str, str):
                 messages = [{"role": "user", "content": msgs_or_str}]
             else:
                 messages = msgs_or_str
+
+            cache_path = None
+            if cache_dir is not None:
+                key = _cache_key(resolved_model_name, messages, seed, temperature)
+                cache_path = cache_dir / f"{key}.json"
+                if cache_path.exists():
+                    try:
+                        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                        return str(cached.get("response", ""))
+                    except Exception as exc:
+                        print(f"[hint_nlp] Cache read failed for {cache_path}: {exc}")
                 
             try:
+                request_kwargs = {
+                    "model": resolved_model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
+                if seed is not None:
+                    request_kwargs["seed"] = seed
                 completion = client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=0.0
+                    **request_kwargs
                 )
-                return completion.choices[0].message.content.strip()
+                response = completion.choices[0].message.content.strip()
+                if cache_path is not None:
+                    try:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        cache_payload = {
+                            "model": resolved_model_name,
+                            "base_url": base_url or "",
+                            "seed": seed,
+                            "temperature": temperature,
+                            "messages": messages,
+                            "response": response,
+                        }
+                        cache_text = json.dumps(
+                            cache_payload,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        )
+                        cache_path.write_text(cache_text, encoding="utf-8")
+                    except Exception as exc:
+                        print(f"[hint_nlp] Cache write failed for {cache_path}: {exc}")
+                return response
             except Exception as exc:
                 return f"#llm_error {exc}"
         
-        print(f"[hint_nlp] Using OpenAI API with model: {model_name}")
+        if base_url:
+            print(f"[hint_nlp] Using OpenAI-compatible API with model: {resolved_model_name} @ {base_url}")
+        else:
+            print(f"[hint_nlp] Using OpenAI API with model: {resolved_model_name}")
         return _call
     except ImportError:
         print("[hint_nlp] OpenAI python package not installed.")
@@ -581,19 +720,25 @@ def get_hf_token() -> Optional[str]:
     return None
 
 
+def _force_local_llm() -> bool:
+    raw = os.environ.get("CRE_HINT_LLM_FORCE_LOCAL", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def build_hf_llm_call(model_name_or_path: str = "distilgpt2", max_new_tokens: int = 64, max_input_tokens: int = 512):
     """
     Build a Hugging Face text-generation callable.
     Checks for OpenAI key first, then HF token, then falls back to local.
     """
-    
-    # 1. Check OpenAI
-    openai_call = build_openai_llm_call()
-    if openai_call:
-        return openai_call
+    force_local = _force_local_llm()
+    if not force_local:
+        # 1. Check OpenAI
+        openai_call = build_openai_llm_call()
+        if openai_call:
+            return openai_call
 
     # 2. Check HF API
-    token = get_hf_token()
+    token = None if force_local else get_hf_token()
     
     # --- API Client Path ---
     if token:
@@ -631,12 +776,16 @@ def build_hf_llm_call(model_name_or_path: str = "distilgpt2", max_new_tokens: in
 
     # --- Local Pipeline Path ---
     try:
-        from transformers import pipeline, AutoTokenizer
+        from transformers import AutoTokenizer, pipeline, set_seed
     except ImportError as e:
         error_msg = str(e)
         def _missing(_):
             raise RuntimeError(f"transformers not installed; provide your own llm_call. Error: {error_msg}")
         return _missing
+
+    seed = _get_llm_seed()
+    temperature = _get_llm_temperature(0.7)
+    cache_dir = _get_llm_cache_dir()
 
     try:
         print(f"[hint_nlp] Loading local model: {model_name_or_path}...")
@@ -663,14 +812,60 @@ def build_hf_llm_call(model_name_or_path: str = "distilgpt2", max_new_tokens: in
     def _call(msgs_or_str):
         if isinstance(msgs_or_str, list):
             # Naively join for base models
+            messages = msgs_or_str
             prompt = "\n\n".join(m.get("content", "") for m in msgs_or_str if m.get("content"))
         else:
             prompt = str(msgs_or_str)
+            messages = [{"role": "user", "content": prompt}]
         prompt = _truncate(prompt)
+        cache_path = None
+        if cache_dir is not None:
+            key = _cache_key(
+                f"local::{model_name_or_path}",
+                [{"role": "user", "content": prompt}],
+                seed,
+                temperature,
+            )
+            cache_path = cache_dir / f"{key}.json"
+            if cache_path.exists():
+                try:
+                    cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                    return str(cached.get("response", ""))
+                except Exception as exc:
+                    print(f"[hint_nlp] Cache read failed for {cache_path}: {exc}")
         try:
+            if seed is not None:
+                set_seed(seed)
             # Adjust generation parameters for better results
-            out = generator(prompt, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.7)[0]["generated_text"]
-            return out[len(prompt):].strip() or out.strip()
+            generate_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": temperature > 0.0,
+            }
+            if temperature > 0.0:
+                generate_kwargs["temperature"] = temperature
+            out = generator(prompt, **generate_kwargs)[0]["generated_text"]
+            response = out[len(prompt):].strip() or out.strip()
+            if cache_path is not None:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_payload = {
+                        "model": f"local::{model_name_or_path}",
+                        "seed": seed,
+                        "temperature": temperature,
+                        "messages": messages,
+                        "truncated_prompt": prompt,
+                        "response": response,
+                    }
+                    cache_text = json.dumps(
+                        cache_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    cache_path.write_text(cache_text, encoding="utf-8")
+                except Exception as exc:
+                    print(f"[hint_nlp] Cache write failed for {cache_path}: {exc}")
+            return response
         except Exception as exc:
             return f"#llm_error {exc}"
 

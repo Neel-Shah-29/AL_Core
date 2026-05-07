@@ -2,6 +2,7 @@ import numpy as np
 from pathlib import Path
 import warnings
 import os
+import re
 from abc import ABCMeta
 from abc import abstractmethod
 from cre.utils import PrintElapse
@@ -12,6 +13,14 @@ from apprentice.agents.cre_agents.hint_nlp import build_hf_llm_call
 
 def _when_weight_debug_enabled():
     return os.environ.get("CRE_STAND_WEIGHT_DEBUG", "0") == "1"
+
+
+def _when_tree_debug_enabled():
+    return os.environ.get("CRE_STAND_TREE_DEBUG", "0") == "1"
+
+
+def _when_predicate_debug_enabled():
+    return os.environ.get("CRE_STAND_PREDICATE_DEBUG", "0") == "1"
 
 
 
@@ -214,11 +223,13 @@ class VectorTransformMixin(RefittableMixin):
         self.gated_hints = kwargs.get('gated_hints', False)
         self.gated_use_llm = kwargs.get('gated_use_llm', False)
         self.gated_filter_labels = kwargs.get('gated_filter_labels', True)
+        self.gated_max_predicates = kwargs.get('gated_max_predicates', 5)
         self.gated_upweight = kwargs.get('gated_upweight', 5.0)
         self.gated_hint_map = kwargs.get('gated_hint_map', None)
         self.apply_ft_weights_to_nominal = kwargs.get('apply_ft_weights_to_nominal', False)
         self.hint_key_resolver = kwargs.get('hint_key_resolver', None)
         self.weight_debug = kwargs.get('weight_debug', _when_weight_debug_enabled())
+        self.tree_debug = kwargs.get('tree_debug', _when_tree_debug_enabled())
         self.weighted_hint_only = kwargs.get('predict_with_weight_only', False)
         self._last_ft_weights = None
         self._active_skill_app = None
@@ -275,6 +286,23 @@ class VectorTransformMixin(RefittableMixin):
             skill_name = getattr(self.skill, "action_type", "unknown_skill")
             print(f"[WhenWeightDebug:{skill_name}] {msg}")
 
+    def _predlog(self, msg):
+        if self.gated_hints and (self.weight_debug or _when_predicate_debug_enabled()):
+            skill_name = getattr(self.skill, "action_type", "unknown_skill")
+            print(f"[WhenPredicates:{skill_name}] {msg}")
+
+    def _treelog(self, msg):
+        if self.tree_debug:
+            skill_name = getattr(self.skill, "action_type", "unknown_skill")
+            print(f"[WhenTree:{skill_name}] {msg}")
+
+    def _describe_nominal_slot(self, slot_idx):
+        try:
+            head, nom = self.vectorizer.unvectorize(int(slot_idx))
+            return f"slot={int(slot_idx)} head={head} nom={int(nom)}"
+        except Exception:
+            return f"slot={int(slot_idx)}"
+
     def _resolve_gated_hint_key(self):
         if callable(self.hint_key_resolver):
             try:
@@ -302,6 +330,33 @@ class VectorTransformMixin(RefittableMixin):
             return self.skill.label
         return getattr(self.skill, "action_type", None)
 
+    def _resolve_hint_field_names(self, hint_key):
+        field_names = []
+        if isinstance(hint_key, str) and hint_key:
+            field_names.append(hint_key)
+
+        active_skill_app = getattr(self, "_active_skill_app", None)
+        hint_precond = getattr(active_skill_app, "hint_precond", None)
+        if not hint_precond and active_skill_app is not None:
+            try:
+                action = getattr(active_skill_app, "action", None)
+                if action is not None:
+                    hint_precond = action.annotations.get("hint_precond")
+            except Exception:
+                hint_precond = None
+
+        if isinstance(hint_precond, str) and hint_precond:
+            field_names.extend(re.findall(r"'([A-Za-z0-9_]+)'", hint_precond))
+            field_names.extend(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.value\b", hint_precond))
+
+        seen = set()
+        ordered = []
+        for field_name in field_names:
+            if field_name and field_name not in seen:
+                seen.add(field_name)
+                ordered.append(field_name)
+        return ordered
+
     def _compute_gated_weights(self, featurized_state):
         if not self.gated_hints:
             return None
@@ -322,7 +377,11 @@ class VectorTransformMixin(RefittableMixin):
                 return None
 
         hint_key = self._resolve_gated_hint_key()
+        preferred_terms = self._resolve_hint_field_names(hint_key)
         hint_text = gated.resolve_hint_text(hint_key, hint_map=self.gated_hint_map)
+        if self.weight_debug:
+            self._wdebug(f"Resolved hint key={hint_key!r} -> {hint_text!r}")
+            self._wdebug(f"Preferred hint terms={preferred_terms!r}")
 
         llm_call = None
         if self.gated_use_llm:
@@ -339,9 +398,27 @@ class VectorTransformMixin(RefittableMixin):
         indices = gated.select_hint_predicates(
             predicates,
             hint_text,
+            hint_key=hint_key,
+            preferred_terms=preferred_terms,
             llm_call=llm_call,
             filter_labels=self.gated_filter_labels,
+            max_count=self.gated_max_predicates,
         )
+        self._predlog(
+            f"threshold={self.gated_max_predicates} hint_key={hint_key!r} selected={len(indices)}"
+        )
+        for idx in indices:
+            if 0 <= idx < len(predicates):
+                self._predlog(f"  [{idx}] {predicates[idx]}")
+        if self.weight_debug:
+            self._wdebug(f"Predicate threshold={self.gated_max_predicates}")
+            if not indices:
+                self._wdebug("No predicates selected for gating.")
+            else:
+                self._wdebug(f"Selected {len(indices)} predicate indices for gating: {indices}")
+                for idx in indices:
+                    if 0 <= idx < len(predicates):
+                        self._wdebug(f"  [{idx}] {predicates[idx]}")
         selected_gvals = [gvals[i] for i in indices]
         _, weights = gated.build_weight_vector(
             self.vectorizer,
@@ -349,6 +426,12 @@ class VectorTransformMixin(RefittableMixin):
             upweight=self.gated_upweight,
         )
         n_up = int(np.count_nonzero(weights > 1.0))
+        if self.weight_debug and n_up > 0:
+            upweighted_slots = np.where(weights > 1.0)[0]
+            preview = upweighted_slots[: min(20, len(upweighted_slots))]
+            self._wdebug("Upweighted nominal feature slots:")
+            for slot_idx in preview:
+                self._wdebug(f"  {self._describe_nominal_slot(slot_idx)}")
         self._wdebug(
             f"Computed weights for hint_key={hint_key!r}; selected={len(indices)} predicates, "
             f"upweighted_slots={n_up}, max_weight={float(np.max(weights)) if len(weights) else 0.0}"
@@ -515,6 +598,30 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
         )
         return ft_weights
 
+    def _print_tree_debug(self, phase):
+        if not self.tree_debug or len(self.X_nom) == 0:
+            return
+
+        try:
+            tree_text = self.classifier.__str__(leaf_inds=True, node_inds=True)
+            self._treelog(f"Tree after {phase}:\n{tree_text}")
+        except Exception as exc:
+            self._treelog(f"Failed to stringify tree after {phase}: {exc}")
+
+        try:
+            from stand.tree_classifier import opt_conjs_str
+            labels = sorted({int(y) for y in self.Y.tolist()})
+            for label in labels:
+                opt_conjs = self.classifier.get_opt_conjs_for_label(label)
+                conj_text = opt_conjs_str(
+                    self.classifier.op_tree,
+                    opt_conjs,
+                    inv_mapper=getattr(self, "inv_mapper", None),
+                )
+                self._treelog(f"Optimal conjunctions for label {label} after {phase}:\n{conj_text}")
+        except Exception as exc:
+            self._treelog(f"Failed to extract optimal conjunctions after {phase}: {exc}")
+
     def ifit(self, state, skill_app, reward):
         self.add_example(state, skill_app, reward) # Insert into X_nom, Y
         if(len(self.X_nom) == 0): return
@@ -525,6 +632,7 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
             f"weights_present={nom_ft_weights is not None}"
         )
         self.classifier.fit(self.X_nom, None, self.Y, nom_ft_weights=nom_ft_weights) # Re-fit ####
+        self._print_tree_debug("ifit")
 
     def fit(self, skill_app_reward_pairs):
         cover = set()
@@ -545,6 +653,7 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
             f"weights_present={nom_ft_weights is not None}"
         )
         self.classifier.fit(self.X_nom, None, self.Y, nom_ft_weights=nom_ft_weights) # Re-fit
+        self._print_tree_debug("fit")
 
     def remove(self, state, skill_app):
         self.remove_example(state, skill_app) # Remove from X_nom, Y
@@ -555,27 +664,38 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
             f"weights_present={nom_ft_weights is not None}"
         )
         self.classifier.fit(self.X_nom, None, self.Y, nom_ft_weights=nom_ft_weights) # Re-fit
+        self._print_tree_debug("remove")
 
     def _predict_with_weighted_features_only(self, X_nom_subset):
         if X_nom_subset.size == 0:
             return 1
         ft_weights = self._get_ft_weights()
         if ft_weights is None:
-            return self.classifier.predict(X_nom_subset, None)[0]
+            self._wdebug(
+                "Weighted-hint mode active but no feature weights available; defaulting to correct (1)."
+            )
+            return 1
 
         upweighted = np.where(ft_weights > 1.0)[0]
         upweighted = upweighted[upweighted < X_nom_subset.shape[1]]
         n_up = len(upweighted)
         if n_up == 0:
+            self._wdebug("Weighted-hint mode active but no upweighted slots found; defaulting to correct (1).")
             return 1
 
         active_up = np.where(X_nom_subset[0, upweighted] != 0)[0]
         n_active = len(active_up)
 
         if self.weight_debug:
+            upweighted_preview = upweighted[: min(20, n_up)]
+            active_preview = [int(x) for x in active_up[: min(20, n_active)]]
             self._wdebug(
-                f"Hint-only predict: upweighted={n_up}, active_upweighted={n_active}"
+                f"Hint-only predict: upweighted={n_up}, active_upweighted={n_active}, "
+                f"upweighted_preview={upweighted_preview.tolist()}, active_preview={active_preview}"
             )
+            for rel_idx in active_preview:
+                slot_idx = upweighted[rel_idx]
+                self._wdebug(f"  ACTIVE {self._describe_nominal_slot(slot_idx)}")
 
         return 1 if n_active == n_up else -1
 
@@ -594,6 +714,8 @@ class BasicSTAND(BaseWhen, VectorTransformMixin):
                 self._wdebug(
                     f"Predict call active_features={len(active)}, active_upweighted={len(active_up)}"
                 )
+                for slot_idx in active_up[:20]:
+                    self._wdebug(f"  ACTIVE {self._describe_nominal_slot(slot_idx)}")
         prediction = self.classifier.predict(X_nom_subset, None)[0]
         return prediction
 
